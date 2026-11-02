@@ -7,7 +7,7 @@ Free backlink discovery using DuckDuckGo, Wayback Machine, and web scraping.
 import json
 import re
 import time
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlsplit
 
 import httpx
 from bs4 import BeautifulSoup
@@ -27,8 +27,30 @@ HEADERS = {
 
 def _clean_domain(domain: str) -> str:
     """Strip protocol and www from a domain string."""
-    domain = domain.replace("https://", "").replace("http://", "").rstrip("/")
-    return domain.replace("www.", "")
+    value = domain.strip()
+    host = urlsplit(value if "://" in value else "//" + value).hostname
+    if not host:
+        raise ValueError("A valid domain is required.")
+    return host.lower().removeprefix("www.")
+
+
+def _is_target_host(url: str, target: str) -> bool:
+    host = (urlsplit(url).hostname or "").lower().rstrip(".")
+    target = target.lower().rstrip(".")
+    return host == target or host.endswith("." + target)
+
+
+def _filter_domain_results(results: list[dict], domain: str) -> list[dict]:
+    """Keep external candidates with domain evidence in search metadata.
+    
+    These are candidates, not verified page mentions or backlinks.
+    """
+    pattern = re.compile(r"(?<![a-z0-9.-])" + re.escape(domain) + r"(?![a-z0-9.-])", re.I)
+    return [
+        r for r in results
+        if not _is_target_host(r["url"], domain)
+        and pattern.search(r["title"] + " " + r["snippet"])
+    ]
 
 
 def _ddgs_text_search(query: str, max_results: int) -> tuple[list[dict], str | None]:
@@ -36,12 +58,18 @@ def _ddgs_text_search(query: str, max_results: int) -> tuple[list[dict], str | N
     results: list[dict] = []
     try:
         with DDGS() as ddgs:
-            for r in ddgs.text(query, max_results=min(max_results, 50)):
-                results.append({
-                    "url": r.get("href", ""),
-                    "title": r.get("title", ""),
-                    "snippet": r.get("body", ""),
-                })
+            seen = set()
+            for r in ddgs.text(query, max_results=max(1, min(max_results, 50))):
+                url = (r.get("href") or r.get("url") or "").strip()
+                title = (r.get("title") or "").strip()
+                snippet = (r.get("body") or r.get("snippet") or "").strip()
+                parsed = urlsplit(url)
+                if parsed.scheme not in ("http", "https") or not parsed.hostname:
+                    continue
+                if not title or url in seen:
+                    continue
+                seen.add(url)
+                results.append({"url": url, "title": title, "snippet": snippet})
         time.sleep(1.5)
     except Exception as e:
         return [], str(e)
@@ -102,7 +130,9 @@ def find_mentions(domain: str, max_results: int = 20) -> str:
     if err:
         return json.dumps({"error": err})
 
+    results = _filter_domain_results(results, domain)
     return json.dumps({
+        "verification": "search candidates only; verify each page",
         "query": query,
         "count": len(results),
         "results": results,
@@ -162,7 +192,9 @@ def find_competitor_link_sources(competitor_domain: str, max_results: int = 20) 
     if err:
         return json.dumps({"error": err})
 
+    results = _filter_domain_results(results, competitor_domain)
     return json.dumps({
+        "verification": "search candidates only; verify each page",
         "competitor": competitor_domain,
         "count": len(results),
         "results": results,
@@ -197,7 +229,7 @@ def verify_page_links(url: str, target_domain: str) -> str:
     found_links = []
     for a in soup.find_all("a", href=True):
         href = a["href"]
-        if target in href:
+        if _is_target_host(urljoin(str(resp.url), href), target):
             found_links.append({
                 "href": href,
                 "anchor_text": a.get_text(strip=True),
@@ -219,11 +251,15 @@ def verify_page_links(url: str, target_domain: str) -> str:
             contact_pages.append({"text": a.get_text(strip=True), "url": full})
 
     is_linked = len(found_links) > 0
+    has_mention = bool(re.search(r"(?<![a-z0-9.-])" + re.escape(target) + r"(?![a-z0-9.-])", soup.get_text(" ", strip=True), re.I))
     return json.dumps({
         "url": url,
         "target_domain": target_domain,
         "is_linked": is_linked,
-        "status": "already links to you" if is_linked else "unlinked mention — outreach opportunity",
+        "has_domain_mention": has_mention,
+        "status": ("already links to you" if is_linked else
+                   "unlinked domain mention" if has_mention else
+                   "no target domain mention or link found"),
         "found_links": found_links,
         "emails_on_page": emails[:5],
         "contact_pages": list({c["url"]: c for c in contact_pages}.values())[:5],
